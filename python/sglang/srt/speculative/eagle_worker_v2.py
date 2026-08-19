@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import logging
 import time
 from dataclasses import replace
@@ -181,6 +182,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Move the native-Qwen MTP embed/lm_head alias as early as safely
+        # possible: both the target and the draft models are now fully loaded
+        # (TpModelWorker.__init__ -> ModelRunner.initialize -> load_model),
+        # and the target's embed/lm_head exist. The draft's BF16 skeleton
+        # embed/head are NOT checkpoint-backed (load_weights only processes
+        # mtp.* keys), so releasing them here frees ~4.736 GiB BEFORE the
+        # target memory-pool/KV allocation starts. Guarded narrowly to native
+        # Qwen MTP; token-mapped heads keep the later fallback in
+        # alloc_memory_pool().
+        self._early_mtp_alias_bound = self._bind_native_qwen_mtp_before_pool()
+
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     def alloc_memory_pool(
@@ -192,13 +204,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        early_mtp_alias = self._early_mtp_alias_bound or False
         self.draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        if not early_mtp_alias:
+            self.init_token_map()
+            self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -255,6 +269,84 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.seed_dsa_topk_from_draft_extend = (
             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
         )
+
+    def _bind_native_qwen_mtp_before_pool(self) -> bool:
+        """Bind native-Qwen MTP embed/lm_head to the target.
+
+        Run as early as possible (EagleDraftWorker.__init__, right after both
+        models finish loading) so the ~4.736 GiB of transient BF16 skeleton
+        duplicates are released BEFORE the target memory-pool / KV allocation
+        starts. Falls back (returns False) for non-native-MTP drafts and
+        token-mapped heads; the caller then keeps the original post-pool
+        ordering.
+        """
+        free0, total0 = torch.cuda.mem_get_info(self.device)
+        logger.warning(
+            "[MTP_ALIAS] pre-alias: free=%s total=%s allocated=%s reserved=%s",
+            free0,
+            total0,
+            torch.cuda.memory_allocated(self.device),
+            torch.cuda.memory_reserved(self.device),
+        )
+        draft_model = self.draft_runner.model
+        if (
+            type(draft_model).__name__ != "Qwen3_5ForCausalLMMTP"
+            or type(draft_model).__module__ != "sglang.srt.models.qwen3_5_mtp"
+        ):
+            return False
+
+        self.init_token_map()
+        if self.hot_token_id is not None:
+            return False
+        self.init_lm_head()
+
+        target_model = self.target_worker.model_runner.model
+        target_embed = target_model.model.embed_tokens.weight
+        draft_embed = draft_model.model.embed_tokens.weight
+        target_head = target_model.lm_head
+        draft_head = draft_model.lm_head
+        same_embed_storage = (
+            target_embed.untyped_storage().data_ptr()
+            == draft_embed.untyped_storage().data_ptr()
+        )
+        same_head_storage = (
+            target_head.weight.untyped_storage().data_ptr()
+            == draft_head.weight.untyped_storage().data_ptr()
+        )
+        duplicate_bytes = 0
+        if not same_embed_storage:
+            duplicate_bytes += draft_embed.numel() * draft_embed.element_size()
+        if not same_head_storage:
+            duplicate_bytes += (
+                draft_head.weight.numel() * draft_head.weight.element_size()
+            )
+
+        logger.warning(
+            "[MTP_ALIAS] bound: embed_storage_shared=%s "
+            "lm_head_module_shared=%s lm_head_storage_shared=%s "
+            "temporary_duplicate_mtp_bytes=%s",
+            same_embed_storage,
+            draft_head is target_head,
+            same_head_storage,
+            duplicate_bytes,
+        )
+        assert same_embed_storage, "native Qwen MTP embedding alias failed"
+        assert draft_head is target_head, "native Qwen MTP lm_head alias failed"
+        assert duplicate_bytes == 0, "native Qwen MTP duplicate weights remain"
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        free1, total1 = torch.cuda.mem_get_info(self.device)
+        logger.warning(
+            "[MTP_ALIAS] after alias: free=%s total=%s allocated=%s reserved=%s "
+            "released_bytes=%s",
+            free1,
+            total1,
+            torch.cuda.memory_allocated(self.device),
+            torch.cuda.memory_reserved(self.device),
+            free1 - free0,
+        )
+        return True
 
     def init_token_map(self):
         # Load hot token ids
