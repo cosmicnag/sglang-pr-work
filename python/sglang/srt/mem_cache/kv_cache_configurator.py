@@ -1699,10 +1699,14 @@ class KVCacheConfigurator:
         if user_limit is not None:
             if user_limit > token_capacity:
                 logging.warning(
-                    f"max_total_tokens={user_limit} is larger than the profiled value "
-                    f"{token_capacity}. Use the profiled value instead."
+                    f"max_total_tokens={user_limit} exceeds the profiled value "
+                    f"{token_capacity}; honoring explicit override. "
+                    "Static KV allocation may OOM."
                 )
-            token_capacity = min(token_capacity, user_limit)
+            # Explicit override trusts the caller: CUDA allocation remains the
+            # physical gate. A bounded overcommit option would be safer for
+            # generic users; not needed for this single-model deployment.
+            token_capacity = user_limit
 
         # Sync across PP ranks (each may have different layer counts)
         if self.server_args.pp_size > 1:
