@@ -73,6 +73,39 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _resolve_eagle_draft_num_layers(kvc) -> Optional[int]:
+    """Resolve physical native-MTP KV layers when no draft path exists."""
+    configured = kvc.spec_aux_config.eagle_draft_num_layers
+    if configured is not None:
+        return int(configured)
+    if kvc.is_draft_worker or not (
+        kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
+    ):
+        return None
+    # External-draft configurations have an explicit --speculative-draft-model-path
+    # (or a spec_aux config already populated by the draft path). The native-MTP
+    # fallback below must only apply when NO external draft path exists; otherwise
+    # the target ``mtp_num_hidden_layers`` could mask the external draft's layer
+    # count and mis-budget the KV pool.
+    if kvc.server_args.speculative_draft_model_path:
+        return None
+
+    hf_config = kvc.model_config.hf_config
+    architectures = getattr(hf_config, "architectures", None) or ()
+    mtp_layers = getattr(kvc.model_config.hf_text_config, "mtp_num_hidden_layers", None)
+    if (
+        "Qwen3_5ForConditionalGeneration" not in architectures
+        or mtp_layers is None
+        or int(mtp_layers) <= 0
+        or not getattr(kvc.mambaish_config, "full_attention_layer_ids", ())
+    ):
+        return None
+
+    # Native Qwen MTP has no speculative_draft_model_path, but its draft worker
+    # still allocates one full-context KV layer per mtp_num_hidden_layers.
+    return int(mtp_layers)
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -151,7 +184,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            eagle_draft_num_layers = _resolve_eagle_draft_num_layers(kvc)
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -390,7 +423,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         if (
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
-            draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
+            draft_layers = _resolve_eagle_draft_num_layers(kvc)
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
                 banded_depths = 0
